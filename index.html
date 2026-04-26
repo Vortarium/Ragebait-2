@@ -93,9 +93,10 @@ window.addEventListener('orientationchange',()=>setTimeout(resizeCanvas,100));
 // We just make sure every physics value is multiplied by dt.
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-const GRAVITY=0.65;   // px per frame² at 60fps
-const JUMP_FORCE=-9.8;
-const SPEED=2.2;
+const GRAVITY=0.9;
+// Max jump height = JUMP_FORCE²/(2*GRAVITY) = 11²/(2*0.9) ≈ 67px
+const JUMP_FORCE=-11.0;
+const SPEED=3.0;
 const TILE=10;
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -122,10 +123,12 @@ let hardcoreRecord=0;
 
 // Infinite mode
 let infiniteScore=0,infiniteRecord=0;
-let infinitePlatCount=0; // platforms landed on
+let infinitePlatCount=0;
 let infiniteBiomeOverride=null;
 let lastInfiniteBiome=null;
 let infiniteMusicIdx=0;
+let infiniteTopY=0;       // world Y of the highest generated platform
+let infiniteScoredPlats=new Set(); // tracks which platform objects have been scored
 
 // Tiers
 function getTier(ms, deaths){
@@ -205,8 +208,8 @@ function recordLevelComplete(lvl,deathCount,ms){
 function loadRecordsForMode(mode){
   try{return JSON.parse(localStorage.getItem('rb2_records_'+mode)||'{}');}catch{return{};}
 }
-function saveProgress(){try{localStorage.setItem('rb2_progress_'+gameMode,JSON.stringify({level,deaths,totalMs}));}catch{}}
-function loadProgress(){try{const p=JSON.parse(localStorage.getItem('rb2_progress_'+gameMode)||'null');if(p){level=p.level||1;deaths=p.deaths||0;totalMs=p.totalMs||0;levelDeaths=0;}}catch{}}
+function saveProgress(){try{localStorage.setItem('rb2_progress_'+gameMode,JSON.stringify({level,deaths,totalMs,hardTimerMs:((gameMode==='hard'||gameMode==='hardcore')?hardTimerMs:undefined)}));}catch{}}
+function loadProgress(){try{const p=JSON.parse(localStorage.getItem('rb2_progress_'+gameMode)||'null');if(p){level=p.level||1;deaths=p.deaths||0;totalMs=p.totalMs||0;levelDeaths=0;if((gameMode==='hard'||gameMode==='hardcore')&&p.hardTimerMs){hardTimerMs=p.hardTimerMs;}}}catch{}}
 function hasSavedProgress(){try{return localStorage.getItem('rb2_progress_'+gameMode)!==null;}catch{return false;}}
 function clearProgress(){try{localStorage.removeItem('rb2_progress_'+gameMode);}catch{}}
 function clearAllData(){try{localStorage.removeItem('rb2_progress');localStorage.removeItem('rb2_records');['normal','hard','hardcore','infinite'].forEach(m=>{localStorage.removeItem('rb2_progress_'+m);localStorage.removeItem('rb2_records_'+m);localStorage.removeItem('rb2_tier_'+m);});localStorage.removeItem('rb2_hc');localStorage.removeItem('rb2_inf');}catch{}}
@@ -277,8 +280,8 @@ function makePlatform(x,y,w,type,rng){
     originX:x,originY:y,
     moveDir:rng()>0.5?1:-1,
     moveAxis:rng()>0.5?'x':'y',
-    moveRange:20+rng()*30,  // capped lower so swings stay reachable
-    moveSpeed:0.6+rng()*0.8,
+    moveRange:20+rng()*30,
+    moveSpeed:1.2+rng()*1.0,  // faster moving platforms
     // breakable: real-time
     breakStartTime:null,
     broken:false,
@@ -346,34 +349,25 @@ function generateLevel(lvl){
   const weights=getZoneWeights(lvl);
 
   for(let i=0;i<count;i++){
-    // Physics: JUMP_FORCE²/(2*GRAVITY) = 9.8²/(2*0.65) ≈ 73px max height
-    // Hard cap well below that so every jump is always reachable.
-    const MAX_RISE=50;
-    const MIN_RISE=40;
-    let rise=MIN_RISE+Math.min(lvl*0.07, MAX_RISE-MIN_RISE);
-    const riseVariance=Math.min(3+lvl*0.02, 7);
-    rise+=rng()*riseVariance;
-    rise=Math.min(rise, MAX_RISE); // hard cap
+    const rise=32+rng()*14; // 32–46px, always reachable under 67px max
 
-    // Moving platforms need EXTRA vertical space because the platform itself
-    // moves up/down by moveRange (up to 80px). The player must be able to
-    // reach the platform at its HIGHEST point, so add the full moveRange.
-    if(prevType==='moving'){
-      // Previous was moving — give generous gap so it's never impossible
-      rise=Math.min(rise+8, MAX_RISE);
-    }
+    // Spring = 2x Y gap for next platform
+    const effectiveRise=prevType==='spring'?rise*2.0:rise;
 
-    // Spring boosts ~1.45x jump force, so can reach ~1.45² ≈ 2x height
-    if(prevType==='spring') rise=Math.min(rise*1.5, MAX_RISE*1.5);
-
-    // X spacing: always shift sideways, wider at higher levels
-    const minXShift=35;
-    const maxXShift=85+lvl*0.15;
+    // X spacing: max 50px shift, and clamp the ACTUAL center to stay in
+    // the middle 60% of the screen so we never drift to an edge
     const xDir=rng()>0.5?1:-1;
-    const xShift=xDir*(minXShift+rng()*(maxXShift-minXShift));
-    const pw=Math.max(18,52-Math.floor(lvl/10)*3-Math.floor(zoneProgress*8));
-    const px=Math.max(6,Math.min(W-pw-6,lastX+xShift-pw/2));
-    const py=lastY-rise;
+    const xShift=xDir*(15+rng()*35); // 15–50px sideways
+    // Platform width: unique per platform, shrinks as levels progress
+    // Section 1 (lvl 1-10): 36–52px, Section 10 (lvl 91-100): 18–28px
+    const baseW=Math.max(18,52-Math.floor(lvl/10)*4);
+    const wVariance=Math.max(4,12-Math.floor(lvl/10));
+    const pw=Math.max(18,baseW-wVariance+Math.floor(rng()*wVariance*2));
+    // Clamp center to [pw/2+20, W-pw/2-20] so platform is always reachable
+    const rawCenter=lastX+xShift;
+    const clampedCenter=Math.max(pw/2+20,Math.min(W-pw/2-20,rawCenter));
+    const px=Math.max(6,Math.min(W-pw-6,clampedCenter-pw/2));
+    const py=lastY-effectiveRise;
 
     // Pick weighted type, avoid consecutive spike_rotate or blink
     let type=pickWeighted(weights,rng);
@@ -398,16 +392,10 @@ function generateLevel(lvl){
     }
 
     plats.push(plat);
-    lastX=px+pw/2;
-
-    // After placing a moving platform, add extra Y gap for the NEXT platform
-    // so the player can always reach it even when the moving one is at its lowest
-    let extraRise=0;
-    if(type==='moving') extraRise=plat.moveAxis==='y'?plat.moveRange+8:10;
-    if(type==='spring') extraRise=20;
-    lastY=py-extraRise;
+    lastX=px+pw/2; // track actual center
+    lastY=py;
     prevType=type;
-    prevRise=rise;
+    prevRise=effectiveRise;
   }
 
   // Goal platform at top (not for infinite mode)
@@ -459,6 +447,101 @@ function generateLevel(lvl){
   }
 
   return{plats,levelHeight,boulderList,laserList};
+}
+
+// ─── Infinite mode batch generator ───────────────────────────────────────────
+// Generates a batch of platforms rising upward from fromY.
+// Uses a random zone each batch for variety.
+let _infBatchSeed=Date.now();
+let _infCurrentBiomeIdx=0; // only changes at score milestones
+// Zone weights for infinite mode — ONE new type introduced per 200 score tier.
+// Never dump all types at once — each tier adds just one new mechanic.
+function _infGetWeights(score){
+  // Tier 0 (0–199):    only normal
+  // Tier 1 (200–399):  normal + breakable
+  // Tier 2 (400–599):  + moving
+  // Tier 3 (600–799):  + spring
+  // Tier 4 (800–999):  + spike_rotate
+  // Tier 5 (1000–1199):+ blink
+  // Tier 6 (1200–1599):+ slippery
+  // Tier 7 (1600+):    all types, balanced
+  const tier=Math.min(Math.floor(score/200),7);
+  if(tier===0)return{normal:100};
+  if(tier===1)return{normal:60,breakable:40};
+  if(tier===2)return{normal:50,breakable:30,moving:20};
+  if(tier===3)return{normal:40,breakable:25,moving:20,spring:15};
+  if(tier===4)return{normal:35,breakable:22,moving:18,spring:15,spike_rotate:10};
+  if(tier===5)return{normal:30,breakable:20,moving:18,spring:14,spike_rotate:10,blink:8};
+  if(tier===6)return{normal:28,breakable:18,moving:16,spring:12,spike_rotate:10,blink:8,slippery:8};
+  return{normal:25,breakable:16,moving:15,spring:12,spike_rotate:11,blink:11,slippery:10};
+}
+function generateInfiniteBatch(fromY, count){
+  _infBatchSeed=(_infBatchSeed*1664525+1013904223)>>>0;
+  const rng=mulberry32(_infBatchSeed^(fromY|0));
+
+  function pickW(weights,rng){
+    const total=Object.values(weights).reduce((a,b)=>a+b,0);
+    let r=rng()*total;
+    for(const[k,v] of Object.entries(weights)){r-=v;if(r<=0)return k;}
+    return Object.keys(weights)[0];
+  }
+  const weights=_infGetWeights(infiniteScore);
+
+  // Platform width: starts at 48px, slowly shrinks to 24px by score 3000.
+  // Score 0→3000 maps to width 48→24. Beyond 3000 stays at 24.
+  function platWidth(rng){
+    const shrink=Math.min(infiniteScore/3000,1); // 0 at score 0, 1 at score 3000
+    const base=Math.round(48-shrink*24); // 48px → 24px
+    const variance=Math.floor(rng()*8)-4; // ±4px per platform
+    return Math.max(20,base+variance);
+  }
+
+  const newPlats=[];
+  // Start lastX in the middle third of the screen to avoid edge drift
+  let lastX=W*0.3+rng()*(W*0.4);
+  let lastY=fromY;
+  let prevType='normal';
+
+  for(let i=0;i<count;i++){
+    // Y rise: fixed safe range, always reachable
+    const rise=30+rng()*12; // 30–42px — well under 67px max jump height
+    const effectiveRise=prevType==='spring'?rise*2.0:rise;
+
+    // X shift: small enough to always be reachable horizontally.
+    // Max horizontal reach during a jump ≈ SPEED * (2*JUMP_FORCE/GRAVITY) frames
+    // = 3.0 * (2*11/0.9) ≈ 3.0 * 24 = 72px. Use 40px max to be safe.
+    const xDir=rng()>0.5?1:-1;
+    const xShift=xDir*(10+rng()*30); // 10–40px sideways — always reachable
+
+    const pw=platWidth(rng);
+    // Clamp center so platform stays in middle 70% of screen
+    const rawCenter=lastX+xShift;
+    const margin=pw/2+16;
+    const clampedCenter=Math.max(margin,Math.min(W-margin,rawCenter));
+    const px=Math.max(6,Math.min(W-pw-6,clampedCenter-pw/2));
+    const py=lastY-effectiveRise;
+
+    let type=pickW(weights,rng);
+    // Never place spike_rotate or blink consecutively — they create impossible timing
+    if((type==='spike_rotate'||type==='blink')&&(prevType==='spike_rotate'||prevType==='blink')){
+      type='normal';
+    }
+
+    const plat=makePlatform(px,py,pw,type,rng);
+    if(type==='moving'&&plat.moveAxis==='x'){
+      const margin2=6+plat.moveRange;
+      plat.originX=Math.max(margin2,Math.min(W-plat.w-margin2,px));
+      plat.x=plat.originX;
+    }
+    if(type==='moving'&&plat.moveAxis==='y'){
+      plat.moveRange=Math.min(plat.moveRange,18);
+    }
+    newPlats.push(plat);
+    lastX=px+pw/2;
+    lastY=py;
+    prevType=type;
+  }
+  return newPlats;
 }
 
 
@@ -543,28 +626,48 @@ function generateBgDecor(levelHeight,rng,biome){
 // ─── Init level ───────────────────────────────────────────────────────────────
 function initLevel(){
   const rng=mulberry32(level*999+7);
-  const{plats,levelHeight,boulderList,laserList}=generateLevel(level);
-  platforms=plats;
-  boulders=boulderList;
-  lasers=laserList;
   deathParticles=[];
   lavaY=null;
   lavaStartTime=null;
 
-  // Lava for levels 91-100: starts below screen, rises after 3s delay
-  // NOT in infinite mode
-  if(level>=91&&gameMode!=='infinite'){
-    lavaY=80;
-    lavaStartTime=Date.now()+3000;
+  if(gameMode==='infinite'){
+    // Infinite mode: generate a fresh starting batch of platforms
+    infiniteScoredPlats=new Set();
+    _infBatchSeed=Date.now();
+    // Start platform
+    const startPlat=makePlatform(W/2-30,0,60,'normal',rng);
+    startPlat.color=[80,200,80];
+    platforms=[startPlat];
+    boulders=[];
+    lasers=[];
+    // Lava starts immediately below the start platform
+    lavaY=80; // world Y — positive = below start (start is at Y=0)
+    lavaStartTime=null;
+    // Generate initial batch upward
+    const batch=generateInfiniteBatch(0,20);
+    platforms.push(...batch);
+    const biome=infiniteBiomeOverride||'forest';
+    bgDecor=generateBgDecor(0,rng,biome);
+  } else {
+    const{plats,levelHeight,boulderList,laserList}=generateLevel(level);
+    platforms=plats;
+    boulders=boulderList;
+    lasers=laserList;
+
+    // Lava for levels 91-100
+    if(level>=91){
+      lavaY=80;
+      lavaStartTime=Date.now()+3000;
+    }
+
+    const biome=getBiome(level);
+    bgDecor=generateBgDecor(levelHeight,rng,biome);
   }
 
   // Hard/hardcore: check timer
   if((gameMode==='hard'||gameMode==='hardcore')&&hardTimerMs<=0){
     hardTimerMs=3600000;level=1;deaths=0;levelDeaths=0;totalMs=0;timerRunning=false;
   }
-
-  const biome=gameMode==='infinite'&&infiniteBiomeOverride?infiniteBiomeOverride:getBiome(level);
-  bgDecor=generateBgDecor(levelHeight,rng,biome);
 
   const start=platforms[0];
   player={
@@ -580,20 +683,16 @@ function initLevel(){
     onPlatform:null,
     coyoteFrames:0,
     jumpBufferFrames:0,
+    jumpConsumed:false,
     landedPlatId:null,
   };
 
-  // Camera: X is locked (centered), Y tracks player upward
-  camera={y:0}; // camera.y = world Y offset (negative = looking up)
+  camera={y:0};
 
   // Wind setup — disabled in infinite mode
   const isWindLevel=(level%10===5)&&gameMode!=='infinite';
   if(isWindLevel){
-    // Preserve windDir across deaths on the same wind level
-    // But recalculate when entering a new wind level
-    const expectedWindLevel=Math.ceil(level/10); // which wind level number (1-10)
     if(windDir===0||windTimer===0){
-      // First time entering this wind level (or coming from non-wind level)
       windLevelCount++;
       windDir=windLevelCount%2===1?1:-1;
     }
@@ -663,6 +762,12 @@ document.addEventListener('keydown',e=>{
   }
 
   if(e.key==='Escape'&&(gameState==='playing'||gameState==='endscreen')){
+    // Pause hard timer before saving
+    if((gameMode==='hard'||gameMode==='hardcore')&&hardActive){
+      hardTimerMs-=(Date.now()-lastHardTick);
+      hardTimerMs=Math.max(0,hardTimerMs);
+      hardActive=false;
+    }
     saveProgress();
     startTransition('out',null,()=>{gameState='menu';menuStarted=true;setMusicTrack('title.mp3');});
     return;
@@ -670,10 +775,12 @@ document.addEventListener('keydown',e=>{
   if(e.key==='Escape'&&gameState==='records'){gameState='menu';return;}
   if(gameState!=='playing')return;
   if((e.key===' '||e.key==='Enter'||e.key==='ArrowUp')&&player&&player.dead&&player.deathTimer>60){
-    if(gameMode==='hardcore'){level=1;deaths=0;levelDeaths=0;totalMs=0;timerRunning=false;timerStart=null;hardTimerMs=3600000;lastHardTick=Date.now();}
+    if(gameMode==='hardcore'){level=1;deaths=0;levelDeaths=0;totalMs=0;timerRunning=false;timerStart=null;hardTimerMs=3600000;lastHardTick=Date.now();setMusicTrack(trackForLevel(1));}
     if(gameMode==='infinite'){
       // Reset score, respawn at bottom of current infinite level
       infiniteScore=0;infinitePlatCount=0;infiniteBiomeOverride=null;lastInfiniteBiome=null;
+      _infCurrentBiomeIdx=0;lavaY=null;lavaStartTime=null;
+      boulders=[];lasers=[];
     }
     startGhostRecording();initLevel();
   }
@@ -696,12 +803,18 @@ canvas.addEventListener('click',e=>{
     if(inBtn(mx,my,BTN_PLAY)){
       playClick();tryPlayMusic();
       startTransition('out',null,()=>{
-        if(hasSavedProgress())loadProgress();
-        else{level=1;deaths=0;}
+        if(hasSavedProgress()){
+          loadProgress(); // restores level, deaths, totalMs, AND hardTimerMs
+          if((gameMode==='hard'||gameMode==='hardcore')){
+            hardActive=true;lastHardTick=Date.now(); // resume timer from saved value
+          }
+        } else {
+          level=1;deaths=0;totalMs=0;
+          if(gameMode==='hard'||gameMode==='hardcore'){hardTimerMs=3600000;hardActive=true;lastHardTick=Date.now();}
+        }
         timerRunning=false;timerStart=null;
         windLevelCount=0;
-        if(gameMode==='hard'||gameMode==='hardcore'){hardTimerMs=3600000;hardActive=true;lastHardTick=Date.now();}
-        if(gameMode==='infinite'){infiniteScore=0;infinitePlatCount=0;infiniteBiomeOverride=null;}
+        if(gameMode==='infinite'){infiniteScore=0;infinitePlatCount=0;infiniteBiomeOverride=null;_infCurrentBiomeIdx=0;}
         initLevel();gameState='playing';menuStarted=true;
         setMusicTrack(trackForLevel(level));
       });
@@ -741,8 +854,8 @@ canvas.addEventListener('click',e=>{
   }
   if(gameState!=='playing'||!player)return;
   if(player.dead&&player.deathTimer>60){
-    if(gameMode==='hardcore'){level=1;deaths=0;levelDeaths=0;totalMs=0;timerRunning=false;timerStart=null;hardTimerMs=3600000;lastHardTick=Date.now();}
-    if(gameMode==='infinite'){infiniteScore=0;infinitePlatCount=0;infiniteBiomeOverride=null;lastInfiniteBiome=null;}
+    if(gameMode==='hardcore'){level=1;deaths=0;levelDeaths=0;totalMs=0;timerRunning=false;timerStart=null;hardTimerMs=3600000;lastHardTick=Date.now();setMusicTrack(trackForLevel(1));}
+    if(gameMode==='infinite'){infiniteScore=0;infinitePlatCount=0;infiniteBiomeOverride=null;lastInfiniteBiome=null;_infCurrentBiomeIdx=0;lavaY=null;lavaStartTime=null;boulders=[];lasers=[];}
     startGhostRecording();initLevel();return;
   }
 });
@@ -766,7 +879,10 @@ if(IS_MOBILE){
   backMobileEl.classList.add('active');
   backMobileEl.addEventListener('touchstart',e=>{
     e.preventDefault();playClick();
-    if(gameState==='playing'){saveProgress();startTransition('out',null,()=>{gameState='menu';menuStarted=true;setMusicTrack('title.mp3');});}
+    if(gameState==='playing'){
+      if((gameMode==='hard'||gameMode==='hardcore')&&hardActive){hardTimerMs-=(Date.now()-lastHardTick);hardTimerMs=Math.max(0,hardTimerMs);hardActive=false;}
+      saveProgress();startTransition('out',null,()=>{gameState='menu';menuStarted=true;setMusicTrack('title.mp3');});
+    }
     else if(gameState==='records'||gameState==='endscreen'){startTransition('out',null,()=>{gameState='menu';setMusicTrack('title.mp3');});}
   },{passive:false});
   const jumpEl=document.getElementById('btn-jump');
@@ -814,31 +930,44 @@ function updateGame(dt){
   // Slippery check
   const onSlippery=player.onPlatform&&player.onPlatform.type==='slippery';
   if(onSlippery){
-    player.vx+=moveX*0.15+windForce;
-    player.vx*=0.96; // 2x more frictionless
+    // Very slippery ice: input barely affects velocity, high momentum retention
+    player.vx+=moveX*0.08+windForce;
+    player.vx*=0.985; // almost no friction
   } else {
-    player.vx+=(moveX*SPEED+windForce-player.vx)*0.95; // snappier response
+    player.vx=moveX*SPEED+windForce;
   }
 
-  // Jump (space, up, w) — holding jump auto-fires when landing
+  // Jump: fires once per ground contact.
+  // Holding space is fine — it will jump the instant you land.
+  // jumpConsumed resets when you leave the ground (go airborne).
   const wantJump=keys[' ']||keys['ArrowUp']||keys['w']||keys['W'];
-  if(wantJump)player.jumpBufferFrames=10;
-  else if(player.jumpBufferFrames>0)player.jumpBufferFrames--;
+
+  // Reset consumed flag when player is airborne (left the ground)
+  if(!player.onGround&&!player.coyoteFrames)player.jumpConsumed=false;
+
+  if(wantJump&&!player.jumpConsumed){
+    player.jumpBufferFrames=10; // buffer the press
+  } else if(!wantJump){
+    player.jumpConsumed=false; // key released — allow next press
+    if(player.jumpBufferFrames>0)player.jumpBufferFrames--;
+  }
 
   if(player.jumpBufferFrames>0&&(player.onGround||player.coyoteFrames>0)){
-    // Check if on spring platform - weaker spring
     const onSpring=player.onPlatform&&player.onPlatform.type==='spring';
-    player.vy=onSpring?JUMP_FORCE*1.45:JUMP_FORCE;
+    // Spring = exactly 2x normal jump height: force = sqrt(2) * JUMP_FORCE ≈ 1.414x
+    // Height ∝ force², so 1.414² = 2x height
+    player.vy=onSpring?JUMP_FORCE*1.414:JUMP_FORCE;
     player.onGround=false;
     player.coyoteFrames=0;
     player.jumpBufferFrames=0;
+    player.jumpConsumed=true; // consumed for this ground contact
     if(onSpring&&player.onPlatform){player.onPlatform.springBounce=15;}
     jumpSfx.currentTime=0;jumpSfx.play().catch(()=>{});
   }
 
   // Gravity
   player.vy+=GRAVITY*dt;
-  if(player.vy>18)player.vy=18;
+  if(player.vy>22)player.vy=22;
 
   // Move X
   player.x+=player.vx*dt;
@@ -952,18 +1081,22 @@ function updateGame(dt){
           levelComplete();return;
         }
 
-        // Infinite mode: count platforms landed — fires ONCE per landing
-        if(gameMode==='infinite'&&player.landedPlatId!==plat){
-          player.landedPlatId=plat;
-          infinitePlatCount++;
-          infiniteScore=infinitePlatCount*10;
+        // Infinite mode: score unique platforms — each platform is +10 ONCE
+        if(gameMode==='infinite'&&!infiniteScoredPlats.has(plat)){
+          infiniteScoredPlats.add(plat);
+          infiniteScore+=10;
           if(infiniteScore>infiniteRecord){
             infiniteRecord=infiniteScore;
-            saveInfiniteRecord(); // save live high score
+            saveInfiniteRecord();
           }
-          const biomeIdx=Math.floor(infinitePlatCount/20)%10;
-          const biomes=['forest','suburbs','egypt','river','clouds','mars','tundra','meadow','jungle','galaxy'];
-          infiniteBiomeOverride=biomes[biomeIdx];
+          // Change biome every 200 score (score 200, 400, 600...)
+          // Only update when crossing a 200-point threshold
+          const newBiomeIdx=Math.floor(infiniteScore/200)%10;
+          if(newBiomeIdx!==_infCurrentBiomeIdx){
+            _infCurrentBiomeIdx=newBiomeIdx;
+            const biomes=['forest','suburbs','egypt','river','clouds','mars','tundra','meadow','jungle','galaxy'];
+            infiniteBiomeOverride=biomes[newBiomeIdx];
+          }
         } else if(player.landedPlatId!==plat){
           player.landedPlatId=plat;
         }
@@ -1014,6 +1147,22 @@ function updateGame(dt){
   // Infinite mode: camera never scrolls down
   if(gameMode==='infinite'&&camera.y>0)camera.y=0;
 
+  // Infinite mode: generate more platforms when player gets close to the top
+  if(gameMode==='infinite'&&platforms.length>0){
+    const topPlat=platforms[platforms.length-1];
+    // If player is within 2 screens of the top, generate more
+    if(player.y-topPlat.y<H*2){
+      const newPlats=generateInfiniteBatch(topPlat.y,15);
+      platforms.push(...newPlats);
+      // Trim old platforms far below screen to save memory
+      const cutoff=camera.y+H+200;
+      while(platforms.length>40&&platforms[0].y>cutoff){
+        infiniteScoredPlats.delete(platforms[0]);
+        platforms.shift();
+      }
+    }
+  }
+
   // Hard/hardcore countdown timer
   if((gameMode==='hard'||gameMode==='hardcore')&&hardActive){
     hardTimerMs-=(Date.now()-lastHardTick);
@@ -1026,11 +1175,52 @@ function updateGame(dt){
     }
   }
 
-  // Infinite mode biome change
+  // Infinite mode biome change — regenerate background when biome changes
   if(gameMode==='infinite'&&infiniteBiomeOverride!==lastInfiniteBiome){
     lastInfiniteBiome=infiniteBiomeOverride;
-    const rng2=mulberry32(Date.now()^infinitePlatCount);
+    const rng2=mulberry32((Date.now()*0.001|0)^infiniteScore);
     bgDecor=generateBgDecor(0,rng2,infiniteBiomeOverride||'forest');
+  }
+
+  // Infinite mode: lava from score 0, boulders at 500+, lasers at 1000+
+  if(gameMode==='infinite'){
+    // Lava: starts immediately (score 0), positioned below the start platform
+    if(lavaY===null){
+      lavaY=player.y+H*1.2; // just below the visible screen
+    }
+    // Lava rises — 5x faster than normal mode, speeds up slightly with score
+    if(lavaY!==null){
+      const lavaSpeed=0.04+Math.min(infiniteScore/20000,0.06); // 0.04–0.10 px/frame
+      lavaY-=dt*lavaSpeed;
+    }
+
+    // Boulders: activate when score hits 500
+    if(infiniteScore>=500&&(!boulders||boulders.length===0)){
+      boulders=[{
+        x:Math.random()*W,y:-30,r:14,vy:0,
+        active:false,warning:false,warnStartTime:0,
+        spawnDelay:1200,nextSpawnTime:Date.now()+2000,
+      }];
+    }
+    // Lasers: activate when score hits 1000
+    if(infiniteScore>=1000&&(!lasers||lasers.length===0)){
+      lasers=[{
+        y:camera.y+H*0.4,active:false,
+        timer:180,interval:120,warnFrames:30,state:'idle',
+      },{
+        y:camera.y+H*0.7,active:false,
+        timer:300,interval:150,warnFrames:30,state:'idle',
+      }];
+    }
+    // Keep lasers at current screen positions as player rises
+    if(lasers&&lasers.length>0){
+      for(const l of lasers){
+        if(l.y>camera.y+H+50){
+          l.y=camera.y-50-Math.random()*100;
+          l.state='idle';l.timer=120+Math.floor(Math.random()*120);
+        }
+      }
+    }
   }
 
   // Boulders (levels 61+) — one at a time, falls all the way to bottom
@@ -1095,13 +1285,16 @@ function updateGame(dt){
     }
   }
 
-  // Lava rising (levels 91-100): lavaY is world Y (positive = below start platform)
+  // Lava rising (levels 91-100 in normal modes, or infinite mode at 300+ score)
   if(lavaY!==null){
-    if(lavaStartTime===null||Date.now()>=lavaStartTime){
-      lavaY-=dt*(20/60); // 2x faster
+    if(gameMode!=='infinite'){
+      // Normal mode: rise after delay
+      if(lavaStartTime===null||Date.now()>=lavaStartTime){
+        lavaY-=dt*(20/60);
+      }
     }
-    const lavaWorldY=lavaY; // world Y of lava surface
-    if(!player.dead&&player.y+player.h>lavaWorldY){killPlayer();return;}
+    // Infinite mode lava rise is handled above in the infinite hazard block
+    if(!player.dead&&player.y+player.h>lavaY){killPlayer();return;}
   }
 
   // Fall off bottom (below start)
@@ -1203,33 +1396,35 @@ function drawBgDecor(decor){
         ctx.fillRect(sx+rc.ox,sy+rc.oy,rc.rw,rc.rh);
       }
     } else if(d.type==='tree16'){
-      // 16-bit style tree with more detail
+      // 16-bit style tree with wind sway
       const h=d.h||24;const v=d.variant||0;
       const trunkC=v===1?'#5a3010':'#6b4020';
       const leafC=v===2?['#1a6b1a','#2a8b2a','#3aab3a']:v===1?['#0a5020','#1a7030','#2a9040']:['#1a7a1a','#2a9a2a','#3aba3a'];
+      // Sway: trees lean in wind direction, also gentle idle sway
+      const swayAmt=windDir*3+Math.sin(t*0.001+d.x*0.05)*1.5;
       ctx.fillStyle=trunkC;ctx.fillRect(sx+h/4,sy,h/6,h*0.35);
-      ctx.fillStyle=leafC[0];ctx.fillRect(sx,sy-h*0.4,h,h*0.5);
-      ctx.fillStyle=leafC[1];ctx.fillRect(sx+h*0.1,sy-h*0.65,h*0.8,h*0.35);
-      ctx.fillStyle=leafC[2];ctx.fillRect(sx+h*0.2,sy-h*0.85,h*0.6,h*0.28);
-      // Highlight
-      ctx.fillStyle='rgba(255,255,200,0.12)';ctx.fillRect(sx+h*0.15,sy-h*0.8,h*0.2,h*0.2);
+      ctx.fillStyle=leafC[0];ctx.fillRect(sx+swayAmt*0.3,sy-h*0.4,h,h*0.5);
+      ctx.fillStyle=leafC[1];ctx.fillRect(sx+h*0.1+swayAmt*0.6,sy-h*0.65,h*0.8,h*0.35);
+      ctx.fillStyle=leafC[2];ctx.fillRect(sx+h*0.2+swayAmt,sy-h*0.85,h*0.6,h*0.28);
+      ctx.fillStyle='rgba(255,255,200,0.12)';ctx.fillRect(sx+h*0.15+swayAmt*0.8,sy-h*0.8,h*0.2,h*0.2);
     } else if(d.type==='jungle_tree'){
       const h=d.h||35;const v=d.variant||0;
+      const swayAmt=windDir*4+Math.sin(t*0.0008+d.x*0.04)*2;
       ctx.fillStyle='#3a2010';ctx.fillRect(sx+h/4,sy,h/5,h*0.4);
       ctx.fillStyle=v===0?'#0a5a18':v===1?'#0a6020':'#156028';
-      ctx.fillRect(sx,sy-h*0.5,h,h*0.6);
+      ctx.fillRect(sx+swayAmt*0.4,sy-h*0.5,h,h*0.6);
       ctx.fillStyle=v===0?'#1a7a28':'#1a8030';
-      ctx.fillRect(sx+h*0.1,sy-h*0.75,h*0.8,h*0.35);
-      ctx.fillStyle='rgba(0,200,50,0.15)';ctx.fillRect(sx+h*0.05,sy-h*0.7,h*0.3,h*0.25);
+      ctx.fillRect(sx+h*0.1+swayAmt*0.8,sy-h*0.75,h*0.8,h*0.35);
+      ctx.fillStyle='rgba(0,200,50,0.15)';ctx.fillRect(sx+h*0.05+swayAmt*0.6,sy-h*0.7,h*0.3,h*0.25);
     } else if(d.type==='pinetree_snow'){
       const h=d.h||22;
+      const swayAmt=windDir*2+Math.sin(t*0.0009+d.x*0.06)*1;
       ctx.fillStyle='#5a3010';ctx.fillRect(sx+h/4,sy,h/6,h*0.3);
-      ctx.fillStyle='#1a5a1a';ctx.fillRect(sx+h*0.1,sy-h*0.4,h*0.8,h*0.5);
-      ctx.fillStyle='#2a7a2a';ctx.fillRect(sx+h*0.2,sy-h*0.65,h*0.6,h*0.3);
-      ctx.fillStyle='#3a9a3a';ctx.fillRect(sx+h*0.3,sy-h*0.85,h*0.4,h*0.25);
-      // Snow on top
-      ctx.fillStyle='rgba(220,235,255,0.9)';ctx.fillRect(sx+h*0.25,sy-h*0.85,h*0.5,h*0.12);
-      ctx.fillRect(sx+h*0.15,sy-h*0.65,h*0.3,h*0.08);
+      ctx.fillStyle='#1a5a1a';ctx.fillRect(sx+h*0.1+swayAmt*0.3,sy-h*0.4,h*0.8,h*0.5);
+      ctx.fillStyle='#2a7a2a';ctx.fillRect(sx+h*0.2+swayAmt*0.6,sy-h*0.65,h*0.6,h*0.3);
+      ctx.fillStyle='#3a9a3a';ctx.fillRect(sx+h*0.3+swayAmt,sy-h*0.85,h*0.4,h*0.25);
+      ctx.fillStyle='rgba(220,235,255,0.9)';ctx.fillRect(sx+h*0.25+swayAmt,sy-h*0.85,h*0.5,h*0.12);
+      ctx.fillRect(sx+h*0.15+swayAmt*0.6,sy-h*0.65,h*0.3,h*0.08);
     } else if(d.type==='pyramid'){
       const w=d.w||50,h=d.h||35;
       // 3D pyramid: front face, right face (darker), left face (medium), top point
@@ -1682,20 +1877,31 @@ function drawLava(camY){
 function drawWindIndicator(){
   if(windDir===0)return;
   const t=Date.now()*0.003;
-  const alpha=0.4+0.2*Math.sin(t);
-  ctx.fillStyle=`rgba(150,200,255,${alpha})`;
-  // Wind lines
-  for(let i=0;i<5;i++){
-    const y=40+i*30;
-    const offset=(t*30*windDir+i*20)%W;
-    const len=20+i*5;
-    ctx.fillRect((offset+W)%W,y,len,1);
-    ctx.fillRect((offset+W-5)%W,y+1,len-5,1);
+  // More prominent wind: more lines, faster, cover full screen height
+  for(let i=0;i<12;i++){
+    const y=20+i*24;
+    const speed=windDir*(50+i*4);
+    const offset=((t*speed+i*37))%W;
+    const len=30+i*6;
+    const alpha=0.25+0.15*Math.sin(t*2+i);
+    ctx.fillStyle=`rgba(180,220,255,${alpha})`;
+    ctx.fillRect((offset+W)%W,y,len,2);
+    ctx.fillRect((offset+W-8)%W,y+2,len-8,1);
+    // Second layer offset for density
+    const offset2=((t*speed*0.7+i*61+W*0.5))%W;
+    ctx.fillStyle=`rgba(150,200,255,${alpha*0.6})`;
+    ctx.fillRect((offset2+W)%W,y+10,len*0.7,1);
   }
-  // Wind label
-  ctx.fillStyle='rgba(150,200,255,0.7)';
+  // Wind label — bigger and more visible
+  const pulse=0.7+0.3*Math.sin(t*3);
+  ctx.fillStyle=`rgba(150,210,255,${pulse})`;
+  ctx.font='bold 10px monospace';ctx.textAlign='center';
+  ctx.fillText(windDir>0?'◀◀◀ WIND ▶▶▶':'◀◀◀ WIND ▶▶▶',W/2,H-8);
   ctx.font='bold 8px monospace';ctx.textAlign='left';
-  ctx.fillText(windDir>0?'WIND ▶▶':'◀◀ WIND',4,H-20);
+  ctx.fillStyle=`rgba(150,210,255,${pulse*0.8})`;
+  ctx.fillText(windDir>0?'▶▶':'◀◀',4,H-8);
+  ctx.textAlign='right';
+  ctx.fillText(windDir>0?'▶▶':'◀◀',W-4,H-8);
 }
 
 
@@ -1705,37 +1911,56 @@ function drawHUD(){
   ctx.fillStyle='rgba(5,0,20,0.75)';ctx.fillRect(0,0,W,18);
   ctx.fillStyle='rgba(120,0,255,0.4)';ctx.fillRect(0,17,W,1);
 
-  // Level or infinite score (top-left)
-  ctx.fillStyle='#cc88ff';ctx.font='bold 9px monospace';ctx.textAlign='left';
   if(gameMode==='infinite'){
-    ctx.fillStyle='#44aaff';
+    // Infinite: SCORE top-left, RECORD center, DEATHS top-right
+    ctx.fillStyle='#44aaff';ctx.font='bold 9px monospace';ctx.textAlign='left';
     ctx.fillText('SCORE: '+infiniteScore,4,12);
+    ctx.fillStyle='#88ffcc';ctx.textAlign='center';ctx.font='bold 9px monospace';
+    ctx.fillText('BEST: '+infiniteRecord,W/2,12);
+    ctx.fillStyle='#ff6666';ctx.textAlign='right';ctx.font='bold 9px monospace';
+    ctx.fillText('✕ '+deaths,W-4,12);
   } else {
+    // Normal/hard/hardcore: LVL top-left, timer center, deaths top-right
+    ctx.fillStyle='#cc88ff';ctx.font='bold 9px monospace';ctx.textAlign='left';
     ctx.fillText('LVL '+level,4,12);
+
+    // Timer center — for hard/hardcore show both stopwatch AND countdown
+    if(gameMode==='hard'||gameMode==='hardcore'){
+      // Stopwatch left of center, countdown right of center
+      ctx.fillStyle='#88ffcc';ctx.textAlign='center';ctx.font='bold 9px monospace';
+      ctx.fillText(formatTime(getElapsedMs()),W/2-40,12);
+      const remaining=Math.max(0,hardTimerMs);
+      const mins=Math.floor(remaining/60000);
+      const secs=Math.floor((remaining%60000)/1000);
+      const timeStr=String(mins).padStart(2,'0')+':'+String(secs).padStart(2,'0');
+      const tc=remaining<30000?'#ff2222':remaining<120000?'#ff8800':'#ffaa22';
+      ctx.fillStyle=tc;ctx.textAlign='center';ctx.font='bold 9px monospace';
+      ctx.fillText('⏱'+timeStr,W/2+40,12);
+    } else {
+      ctx.fillStyle='#88ffcc';ctx.textAlign='center';ctx.font='bold 9px monospace';
+      ctx.fillText(formatTime(getElapsedMs()),W/2,12);
+    }
+
+    ctx.fillStyle='#ff6666';ctx.textAlign='right';ctx.font='bold 9px monospace';
+    ctx.fillText('✕ '+deaths,W-4,12);
   }
 
-  // Timer (center)
-  ctx.fillStyle='#88ffcc';ctx.textAlign='center';ctx.font='bold 9px monospace';
-  ctx.fillText(formatTime(getElapsedMs()),W/2,12);
-
-  // Deaths (top-right)
-  ctx.fillStyle='#ff6666';ctx.textAlign='right';ctx.font='bold 9px monospace';
-  ctx.fillText('✕ '+deaths,W-4,12);
-
-  // Progress bar
-  const pct=gameMode==='infinite'?Math.min(infiniteScore/2000,1):(level-1)/100;
-  ctx.fillStyle='rgba(80,0,160,0.5)';ctx.fillRect(0,H+2,W,6);
-  ctx.fillStyle=gameMode==='infinite'?'#44aaff':'#9933ff';ctx.fillRect(0,H+2,W*pct,6);
-  ctx.fillStyle='rgba(180,100,255,0.5)';ctx.fillRect(0,H+2,W*pct,2);
+  // Progress bar (not for infinite)
+  if(gameMode!=='infinite'){
+    const pct=(level-1)/100;
+    ctx.fillStyle='rgba(80,0,160,0.5)';ctx.fillRect(0,H+2,W,6);
+    ctx.fillStyle='#9933ff';ctx.fillRect(0,H+2,W*pct,6);
+    ctx.fillStyle='rgba(180,100,255,0.5)';ctx.fillRect(0,H+2,W*pct,2);
+  }
 
   // Wind level indicator
-  if(level%10===5&&windDir!==0){
+  if(level%10===5&&windDir!==0&&gameMode!=='infinite'){
     ctx.fillStyle='rgba(100,180,255,0.8)';ctx.font='bold 7px monospace';ctx.textAlign='center';
     ctx.fillText(windDir>0?'WIND →':'← WIND',W/2,H-4);
   }
 
   // Boss level warning
-  if(isBossLevel(level)){
+  if(isBossLevel(level)&&gameMode!=='infinite'){
     const pulse=0.5+0.5*Math.sin(Date.now()*0.006);
     ctx.fillStyle=`rgba(255,0,100,${pulse})`;ctx.font='bold 8px monospace';ctx.textAlign='center';
     ctx.fillText(Date.now()-ghostSpawnStartTime<GHOST_SPAWN_DELAY?'⚠ GHOST INCOMING ⚠':'⚠ GHOST CHASING ⚠',W/2,H-4);
@@ -1748,30 +1973,34 @@ function drawHUD(){
     ctx.fillText('▲ LAVA RISING',4,H-4);
   }
 
-  // Hard/hardcore timer at bottom — show countdown from 60:00
-  if((gameMode==='hard'||gameMode==='hardcore')&&hardActive){
-    const remaining=Math.max(0,hardTimerMs);
-    const mins=Math.floor(remaining/60000);
-    const secs=Math.floor((remaining%60000)/1000);
-    const timeStr=String(mins).padStart(2,'0')+':'+String(secs).padStart(2,'0');
-    const tc=remaining<30000?'#ff2222':remaining<120000?'#ff8800':'#ffaa22';
-    ctx.fillStyle=tc;ctx.font='bold 9px monospace';ctx.textAlign='right';
-    ctx.fillText('⏱ '+timeStr,W-4,H-4);
+  // Infinite mode hazard warnings
+  if(gameMode==='infinite'){
+    if(infiniteScore>=500&&infiniteScore<1000){
+      ctx.fillStyle='rgba(180,100,50,0.7)';ctx.font='bold 7px monospace';ctx.textAlign='right';
+      ctx.fillText('☄ ROCKS FALLING',W-4,H-4);
+    } else if(infiniteScore>=1000){
+      ctx.fillStyle='rgba(255,80,0,0.7)';ctx.font='bold 7px monospace';ctx.textAlign='right';
+      ctx.fillText('☄ ROCKS + LAZERS',W-4,H-4);
+    }
   }
 
   // Death screen
   if(player&&player.dead&&player.deathTimer>30){
     ctx.fillStyle='rgba(0,0,0,0.6)';ctx.fillRect(0,0,W,H);
     const alpha=Math.min(1,(player.deathTimer-30)/30);
-    // Big YOU DIED
     ctx.fillStyle=`rgba(255,50,50,${alpha})`;ctx.font='bold 16px monospace';ctx.textAlign='center';
-    ctx.fillText('YOU DIED',W/2,H/2-22);
-    // Death message (mean roast)
+    ctx.fillText('YOU DIED',W/2,H/2-28);
+    // Death message
     ctx.fillStyle=`rgba(255,180,80,${alpha})`;ctx.font='bold 10px monospace';
-    ctx.fillText(currentDeathMsg,W/2,H/2-4);
+    ctx.fillText(currentDeathMsg,W/2,H/2-10);
+    // Infinite: show record score
+    if(gameMode==='infinite'){
+      ctx.fillStyle=`rgba(100,200,255,${alpha})`;ctx.font='bold 9px monospace';
+      ctx.fillText('SCORE: '+infiniteScore+'  BEST: '+infiniteRecord,W/2,H/2+8);
+    }
     if(player.deathTimer>60){
       ctx.fillStyle=`rgba(160,160,255,${alpha})`;ctx.font='8px monospace';
-      ctx.fillText('SPACE / ↑ / TAP to retry',W/2,H/2+14);
+      ctx.fillText('CLICK TO RESPAWN',W/2,H/2+24);
     }
   }
 }
